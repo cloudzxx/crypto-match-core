@@ -10,15 +10,17 @@ import (
 type BalanceType uint8
 
 const (
-	BalanceTypeAvailable BalanceType = iota
-	BalanceTypeFreeze
+	BalanceTypeAvailable BalanceType = iota // 可用余额
+	BalanceTypeFreeze                        // 冻结余额（已挂单但未成交）
 )
 
+// 一个币种对应 Available（可用）+ Freeze（冻结）两个状态
 type Balance struct {
 	Available decimal.Decimal
 	Freeze    decimal.Decimal
 }
 
+// 内存余额管理器：userID → asset → Balance
 type BalanceManager struct {
 	balances map[uint32]map[string]*Balance
 	mu       sync.RWMutex
@@ -30,6 +32,7 @@ func NewBalanceManager() *BalanceManager {
 	}
 }
 
+// 查询余额，不存在则返回零值
 func (bm *BalanceManager) GetBalance(userID uint32, asset string) *Balance {
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
@@ -49,6 +52,7 @@ func (bm *BalanceManager) GetBalance(userID uint32, asset string) *Balance {
 	}
 }
 
+// 下单时冻结：Available -= amount, Freeze += amount
 func (bm *BalanceManager) Freeze(userID uint32, asset string, amount decimal.Decimal) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
@@ -74,6 +78,7 @@ func (bm *BalanceManager) Freeze(userID uint32, asset string, amount decimal.Dec
 	return nil
 }
 
+// 撤单或部分成交后退还：Freeze -= amount, Available += amount
 func (bm *BalanceManager) Unfreeze(userID uint32, asset string, amount decimal.Decimal) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
@@ -96,6 +101,8 @@ func (bm *BalanceManager) Unfreeze(userID uint32, asset string, amount decimal.D
 	return nil
 }
 
+// 成交后结算：调整 Available 和 Freeze
+// positiveDelta 表示收入，negativeDelta 表示支出
 func (bm *BalanceManager) SettleTrade(userID uint32, asset string, availableDelta, freezeDelta decimal.Decimal) error {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
@@ -122,6 +129,7 @@ func (bm *BalanceManager) SettleTrade(userID uint32, asset string, availableDelt
 	return nil
 }
 
+// 直接设置余额（用于快照恢复）
 func (bm *BalanceManager) SetBalance(userID uint32, asset string, available, freeze decimal.Decimal) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()

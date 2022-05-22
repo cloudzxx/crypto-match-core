@@ -7,6 +7,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// 订单：价格优先 → 时间优先排序的基础单位
 type Order struct {
 	ID        uint64
 	Type      OrderType
@@ -15,8 +16,8 @@ type Order struct {
 	Market    string
 	Price     decimal.Decimal
 	Amount    decimal.Decimal
-	Left      decimal.Decimal
-	Freeze    decimal.Decimal
+	Left      decimal.Decimal          // 未成交数量（撮合时递减）
+	Freeze    decimal.Decimal          // 已冻结的资产数量
 	Source    string
 	CreatedAt int64
 	UpdatedAt int64
@@ -25,28 +26,34 @@ type Order struct {
 type OrderType uint8
 
 const (
-	OrderTypeLimit OrderType = iota
-	OrderTypeMarket
+	OrderTypeLimit  OrderType = iota // 限价单
+	OrderTypeMarket                  // 市价单（预留）
 )
 
 type Side uint8
 
 const (
-	SideAsk Side = iota
-	SideBid
+	SideAsk Side = iota // 卖单
+	SideBid             // 买单
 )
 
+// 同价格档位的订单列表（按到达时间排序）
 type PriceLevel struct {
 	Price  decimal.Decimal
 	Orders []*Order
 }
 
+// 基于红黑树的订单簿
+// - Asks 升序排列（最低卖价在最前）
+// - Bids 降序排列（最高买价在最前）
+// - orderIndex 提供 O(1) 的订单查询
 type OrderBook struct {
 	tree       *redblacktree.Tree
 	orderIndex map[uint64]*Order
 	mu         sync.RWMutex
 }
 
+// 红黑树按价格升序排序；买单遍历时从右向左（降序），卖单从左向右（升序）
 func NewOrderBook() *OrderBook {
 	return &OrderBook{
 		tree: redblacktree.NewWith(func(a, b interface{}) int {
@@ -56,6 +63,7 @@ func NewOrderBook() *OrderBook {
 	}
 }
 
+// 插入订单：写入 orderIndex + 追加到对应价格档位
 func (ob *OrderBook) Insert(order *Order) {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
@@ -77,6 +85,7 @@ func (ob *OrderBook) Insert(order *Order) {
 	pl.Orders = append(pl.Orders, order)
 }
 
+// 撤销订单：从 orderIndex 和价格档位中移除，空档位自动清理
 func (ob *OrderBook) Remove(order *Order) bool {
 	ob.mu.Lock()
 	defer ob.mu.Unlock()
@@ -115,6 +124,7 @@ func (ob *OrderBook) Len() int {
 	return ob.tree.Size()
 }
 
+// 按价格升序遍历所有档位，callback 返回 false 时提前终止
 func (ob *OrderBook) Range(callback func(price decimal.Decimal, orders []*Order) bool) {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
@@ -148,6 +158,7 @@ func (ob *OrderBook) Best() *Order {
 	return pl.Orders[0]
 }
 
+// 最高买入价（红黑树最右节点）
 func (ob *OrderBook) BestBid() *Order {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()
@@ -168,6 +179,7 @@ func (ob *OrderBook) BestBid() *Order {
 	return pl.Orders[0]
 }
 
+// 最低卖出价（红黑树最左节点）
 func (ob *OrderBook) BestAsk() *Order {
 	ob.mu.RLock()
 	defer ob.mu.RUnlock()

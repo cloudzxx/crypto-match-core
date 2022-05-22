@@ -15,6 +15,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// gRPC 服务端：负责协议层解析 + 调用撮合核心 + 写操作日志 + 推送事件
 type Server struct {
 	UnimplementedMatchEngineServer
 	addr        string
@@ -65,6 +66,7 @@ func (s *Server) Stop() {
 	}
 }
 
+// 限价单入口：分配 ID → 冻结资产 → 入订单簿 → 写操作日志
 func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*OrderReply, error) {
 	orderID := atomic.AddUint64(&s.nextOrderID, 1)
 
@@ -98,6 +100,7 @@ func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*Orde
 	}
 
 	if req.Side == "bid" {
+		// 买单冻结 quote（Money）市值
 		order.Side = service.SideBid
 		freezeAmount := price.Mul(amount)
 		if err := s.bm.Freeze(req.UserId, mkt.Money, freezeAmount); err != nil {
@@ -105,12 +108,14 @@ func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*Orde
 		}
 		order.Freeze = freezeAmount
 	} else {
+		// 卖单冻结 base（Stock）数量
 		if err := s.bm.Freeze(req.UserId, mkt.Stock, amount); err != nil {
 			return nil, err
 		}
 		order.Freeze = amount
 	}
 
+	// 入订单簿等待撮合
 	if order.Side == service.SideAsk {
 		mkt.Asks.Insert(order)
 	} else {
@@ -139,6 +144,7 @@ func (s *Server) PutMarketOrder(ctx context.Context, req *PutMarketRequest) (*Or
 	return nil, fmt.Errorf("market order not implemented")
 }
 
+// 撤单流程：遍历所有市场检索订单 → 验证用户所有权 → 从订单簿移除 → 解冻资产
 func (s *Server) CancelOrder(ctx context.Context, req *CancelRequest) (*CancelReply, error) {
 	mktName := ""
 	var order *service.Order
