@@ -1,0 +1,134 @@
+syntax = "proto3";
+
+package matchengine;
+
+option go_package = "github.com/cloudzxx/crypto-match-core/internal/handler";
+
+service MatchEngine {
+    rpc PutLimitOrder(PutLimitRequest) returns (OrderReply);
+    rpc PutMarketOrder(PutMarketRequest) returns (OrderReply);
+    rpc CancelOrder(CancelRequest) returns (CancelReply);
+    rpc QueryOrder(QueryRequest) returns (OrderReply);
+    rpc QueryBalance(BalanceRequest) returns (BalanceReply);
+    rpc QueryOrderBook(OrderBookRequest) returns (OrderBookReply);
+    rpc QueryDepth(DepthRequest) returns (DepthReply);
+    rpc MarketList(Empty) returns (MarketListReply);
+    rpc MarketSummary(MarketRequest) returns (MarketSummaryReply);
+}
+
+message Empty {}
+
+message PutLimitRequest {
+    uint32 user_id = 1;
+    string market = 2;
+    string side = 3;
+    string price = 4;
+    string amount = 5;
+    string source = 6;
+}
+
+message PutMarketRequest {
+    uint32 user_id = 1;
+    string market = 2;
+    string side = 3;
+    string amount = 4;
+    string source = 5;
+}
+
+message CancelRequest {
+    uint32 user_id = 1;
+    uint64 order_id = 2;
+}
+
+message QueryRequest {
+    uint32 user_id = 1;
+    uint64 order_id = 2;
+}
+
+message BalanceRequest {
+    uint32 user_id = 1;
+    string asset = 2;
+}
+
+message OrderBookRequest {
+    string market = 1;
+    int32 limit = 2;
+}
+
+message DepthRequest {
+    string market = 1;
+    int32 limit = 2;
+}
+
+message MarketRequest {
+    string market = 1;
+}
+
+message OrderReply {
+    uint64 order_id = 1;
+    uint32 user_id = 2;
+    string market = 3;
+    string side = 4;
+    string price = 5;
+    string amount = 6;
+    string left = 7;
+    string deal_stock = 8;
+    string deal_money = 9;
+    string deal_fee = 10;
+    string status = 11;
+    int64 created_at = 12;
+}
+
+message CancelReply {
+    bool success = 1;
+    string message = 2;
+}
+
+message BalanceReply {
+    uint32 user_id = 1;
+    string asset = 2;
+    string available = 3;
+    string freeze = 4;
+}
+
+message OrderBookReply {
+    string market = 1;
+    repeated OrderBookEntry asks = 2;
+    repeated OrderBookEntry bids = 3;
+}
+
+message OrderBookEntry {
+    string price = 1;
+    string amount = 2;
+}
+
+message DepthReply {
+    string market = 1;
+    repeated DepthEntry asks = 2;
+    repeated DepthEntry bids = 3;
+}
+
+message DepthEntry {
+    string price = 1;
+    string amount = 2;
+    string total = 3;
+}
+
+message MarketListReply {
+    repeated MarketInfo markets = 1;
+}
+
+message MarketInfo {
+    string name = 1;
+    string stock = 2;
+    string money = 3;
+}
+
+message MarketSummaryReply {
+    string name = 1;
+    string last = 2;
+    string high = 3;
+    string low = 4;
+    string volume = 5;
+    string deal = 6;
+}
