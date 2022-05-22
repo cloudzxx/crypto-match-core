@@ -33,21 +33,19 @@ func (sm *SliceManager) DoSlice(mkts []*service.Market, bm *service.BalanceManag
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback(ctx)
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO slice_history (slice_id, begin_time, end_time)
 		VALUES ($1, $2, $2)
 	`, sliceID, now)
 	if err != nil {
+		tx.Rollback(ctx)
 		return "", err
 	}
 
-	err = tx.Commit(ctx)
-	if err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
-
 	return sliceID, nil
 }
 

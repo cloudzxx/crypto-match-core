@@ -125,9 +125,10 @@ func (ob *OrderBook) Len() int {
 }
 
 // 按价格升序遍历所有档位，callback 返回 false 时提前终止
+// 注：callback 内可能修改订单状态，故使用写锁
 func (ob *OrderBook) Range(callback func(price decimal.Decimal, orders []*Order) bool) {
-	ob.mu.RLock()
-	defer ob.mu.RUnlock()
+	ob.mu.Lock()
+	defer ob.mu.Unlock()
 
 	it := ob.tree.Iterator()
 	for it.Next() {

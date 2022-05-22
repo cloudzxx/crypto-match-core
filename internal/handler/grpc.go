@@ -5,14 +5,15 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/cloudzxx/crypto-match-core/internal/publisher"
 	"github.com/cloudzxx/crypto-match-core/internal/repository"
 	"github.com/cloudzxx/crypto-match-core/internal/service"
-	"google.golang.org/grpc"
 	"github.com/shopspring/decimal"
+	"google.golang.org/grpc"
 )
 
 // gRPC 服务端：负责协议层解析 + 调用撮合核心 + 写操作日志 + 推送事件
@@ -66,10 +67,8 @@ func (s *Server) Stop() {
 	}
 }
 
-// 限价单入口：分配 ID → 冻结资产 → 入订单簿 → 写操作日志
+// 限价单入口：分配 ID → 校验 → 冻结 → ProcessOrder（入簿+撮合+结算）→ 写日志
 func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*OrderReply, error) {
-	orderID := atomic.AddUint64(&s.nextOrderID, 1)
-
 	mkt, err := s.mm.Get(req.Market)
 	if err != nil {
 		return nil, err
@@ -79,10 +78,25 @@ func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*Orde
 	if err != nil {
 		return nil, err
 	}
-
 	amount, err := decimal.NewFromString(req.Amount)
 	if err != nil {
 		return nil, err
+	}
+
+	// 精度校验
+	if err := validatePrecision(price, mkt.MoneyPrec); err != nil {
+		return nil, fmt.Errorf("price precision exceeds %d: %w", mkt.MoneyPrec, err)
+	}
+	if err := validatePrecision(amount, mkt.StockPrec); err != nil {
+		return nil, fmt.Errorf("amount precision exceeds %d: %w", mkt.StockPrec, err)
+	}
+	if amount.LessThan(mkt.MinAmount) {
+		return nil, fmt.Errorf("amount %s below minimum %s", amount, mkt.MinAmount)
+	}
+
+	orderID := atomic.AddUint64(&s.nextOrderID, 1)
+	if orderID == 0 {
+		return nil, fmt.Errorf("order ID overflow")
 	}
 
 	order := &service.Order{
@@ -100,7 +114,6 @@ func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*Orde
 	}
 
 	if req.Side == "bid" {
-		// 买单冻结 quote（Money）市值
 		order.Side = service.SideBid
 		freezeAmount := price.Mul(amount)
 		if err := s.bm.Freeze(req.UserId, mkt.Money, freezeAmount); err != nil {
@@ -108,25 +121,42 @@ func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*Orde
 		}
 		order.Freeze = freezeAmount
 	} else {
-		// 卖单冻结 base（Stock）数量
 		if err := s.bm.Freeze(req.UserId, mkt.Stock, amount); err != nil {
 			return nil, err
 		}
 		order.Freeze = amount
 	}
 
-	// 入订单簿等待撮合
-	if order.Side == service.SideAsk {
-		mkt.Asks.Insert(order)
-	} else {
-		mkt.Bids.Insert(order)
+	// ProcessOrder 内部：入簿 → 撮合 → 余额结算 → 清理已成交订单
+	results, err := s.matcher.ProcessOrder(mkt, order)
+	if err != nil {
+		return nil, err
 	}
 
+	// 写操作日志
 	s.operlog.Write(&repository.OperLog{
 		Type:  repository.OperTypeOrderPut,
 		Data:  order,
 		SeqID: s.operlog.NextSeqID(),
 	})
+	for _, r := range results {
+		s.operlog.Write(&repository.OperLog{
+			Type:  repository.OperTypeOrderUpdate,
+			Data:  r,
+			SeqID: s.operlog.NextSeqID(),
+		})
+	}
+
+	left := order.Left.String()
+	status := "PUT"
+	if order.Left.IsZero() {
+		status = "FILLED"
+	} else if len(results) > 0 {
+		status = "PARTIAL"
+	}
+	if order.Left.Equal(order.Amount) {
+		status = "PUT"
+	}
 
 	return &OrderReply{
 		OrderId: order.ID,
@@ -135,55 +165,42 @@ func (s *Server) PutLimitOrder(ctx context.Context, req *PutLimitRequest) (*Orde
 		Side:    req.Side,
 		Price:   req.Price,
 		Amount:  req.Amount,
-		Left:    req.Amount,
-		Status:  "PUT",
+		Left:    left,
+		Status:  status,
 	}, nil
+}
+
+func validatePrecision(val decimal.Decimal, prec int) error {
+	s := val.String()
+	if dot := strings.Index(s, "."); dot >= 0 {
+		if len(s)-dot-1 > prec {
+			return fmt.Errorf("value %s exceeds %d decimal places", s, prec)
+		}
+	}
+	return nil
 }
 
 func (s *Server) PutMarketOrder(ctx context.Context, req *PutMarketRequest) (*OrderReply, error) {
 	return nil, fmt.Errorf("market order not implemented")
 }
 
-// 撤单流程：遍历所有市场检索订单 → 验证用户所有权 → 从订单簿移除 → 解冻资产
+// 撤单流程：定位市场 → 通过 Matcher.CancelOrder 串行化执行
 func (s *Server) CancelOrder(ctx context.Context, req *CancelRequest) (*CancelReply, error) {
-	mktName := ""
-	var order *service.Order
-
-	markets := s.mm.List()
-	for _, m := range markets {
-		if o := m.Bids.Get(req.OrderId); o != nil {
-			order = o
-			mktName = m.Name
-			break
-		}
-		if o := m.Asks.Get(req.OrderId); o != nil {
-			order = o
-			mktName = m.Name
+	var mkt *service.Market
+	for _, m := range s.mm.List() {
+		m.Asks.Get(req.OrderId)
+		if m.Asks.Get(req.OrderId) != nil || m.Bids.Get(req.OrderId) != nil {
+			mkt = m
 			break
 		}
 	}
-
-	if order == nil {
+	if mkt == nil {
 		return &CancelReply{Success: false, Message: "order not found"}, nil
 	}
 
-	if order.UserID != req.UserId {
-		return &CancelReply{Success: false, Message: "unauthorized"}, nil
+	if err := s.matcher.CancelOrder(mkt, req.OrderId, req.UserId); err != nil {
+		return &CancelReply{Success: false, Message: err.Error()}, nil
 	}
-
-	mkt, _ := s.mm.Get(mktName)
-	if order.Side == service.SideBid {
-		mkt.Bids.Remove(order)
-		if err := s.bm.Unfreeze(order.UserID, mkt.Money, order.Freeze); err != nil {
-			return &CancelReply{Success: false, Message: err.Error()}, nil
-		}
-	} else {
-		mkt.Asks.Remove(order)
-		if err := s.bm.Unfreeze(order.UserID, mkt.Stock, order.Freeze); err != nil {
-			return &CancelReply{Success: false, Message: err.Error()}, nil
-		}
-	}
-
 	return &CancelReply{Success: true, Message: ""}, nil
 }
 

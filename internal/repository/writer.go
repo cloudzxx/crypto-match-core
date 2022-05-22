@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"sync"
 	"time"
 )
@@ -47,10 +48,7 @@ func NewWriter(pg *PG, batchMs int) *Writer {
 }
 
 func (w *Writer) Write(opt *OperLog) {
-	select {
-	case w.logs <- opt:
-	default:
-	}
+	w.logs <- opt
 }
 
 func (w *Writer) run() {
@@ -83,12 +81,18 @@ func (w *Writer) flush() {
 
 	ctx := context.Background()
 
-	for _, log := range w.batch {
-		data, _ := json.Marshal(log.Data)
-		w.pg.Exec(ctx, `
+	for _, l := range w.batch {
+		data, err := json.Marshal(l.Data)
+		if err != nil {
+			log.Printf("operlog marshal error: %v", err)
+			continue
+		}
+		if err := w.pg.Exec(ctx, `
 			INSERT INTO operlog (opt_type, opt_data, seq_id)
 			VALUES ($1, $2, $3)
-		`, log.Type, data, w.seqID)
+		`, l.Type, data, w.seqID); err != nil {
+			log.Printf("operlog write error: %v", err)
+		}
 		w.seqID++
 	}
 
@@ -97,7 +101,19 @@ func (w *Writer) flush() {
 
 func (w *Writer) Stop() {
 	close(w.done)
-	time.Sleep(time.Second)
+	// 等待 run goroutine 处理完剩余日志
+	done := make(chan struct{})
+	go func() {
+		for len(w.logs) > 0 || len(w.batch) > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("operlog drain timeout, %d logs may be lost", len(w.logs)+len(w.batch))
+	}
 }
 
 func (w *Writer) NextSeqID() int64 {

@@ -3,6 +3,7 @@ package publisher
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -66,7 +67,10 @@ type BalanceMessage struct {
 }
 
 func (p *Publisher) PublishOrder(ctx context.Context, msg *OrderMessage) error {
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
 	return p.writers["orders"].WriteMessages(ctx, kafka.Message{
 		Key:   []byte(msg.Market),
 		Value: data,
@@ -74,7 +78,10 @@ func (p *Publisher) PublishOrder(ctx context.Context, msg *OrderMessage) error {
 }
 
 func (p *Publisher) PublishDeal(ctx context.Context, msg *DealMessage) error {
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
 	return p.writers["deals"].WriteMessages(ctx, kafka.Message{
 		Key:   []byte(msg.Market),
 		Value: data,
@@ -82,7 +89,10 @@ func (p *Publisher) PublishDeal(ctx context.Context, msg *DealMessage) error {
 }
 
 func (p *Publisher) PublishBalance(ctx context.Context, msg *BalanceMessage) error {
-	data, _ := json.Marshal(msg)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
 	return p.writers["balances"].WriteMessages(ctx, kafka.Message{
 		Key:   []byte(msg.Asset),
 		Value: data,
@@ -90,8 +100,10 @@ func (p *Publisher) PublishBalance(ctx context.Context, msg *BalanceMessage) err
 }
 
 func (p *Publisher) Close() error {
-	for _, w := range p.writers {
-		w.Close()
+	for name, w := range p.writers {
+		if err := w.Close(); err != nil {
+			log.Printf("kafka writer %s close error: %v", name, err)
+		}
 	}
 	return nil
 }

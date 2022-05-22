@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/shopspring/decimal"
@@ -25,6 +26,7 @@ type MatchResult struct {
 
 // 撮合引擎：价格优先 → 时间优先
 // 全市场共享一把锁，保证撮合串行化
+// 所有订单操作（下单、撤单）均应通过此锁串行化
 type Matcher struct {
 	mm       *Manager
 	bm       *BalanceManager
@@ -35,6 +37,124 @@ func NewMatcher(mm *Manager, bm *BalanceManager) *Matcher {
 	return &Matcher{
 		mm: mm,
 		bm: bm,
+	}
+}
+
+// Lock 暴露锁用于外部协调订单生命周期
+func (m *Matcher) Lock()   { m.mu.Lock() }
+func (m *Matcher) Unlock() { m.mu.Unlock() }
+
+// ProcessOrder 在撮合锁内完成完整流程：入簿 → 撮合 → 结算 → 清理
+func (m *Matcher) ProcessOrder(mkt *Market, order *Order) ([]MatchResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if order.Side == SideAsk {
+		mkt.Asks.Insert(order)
+	} else {
+		mkt.Bids.Insert(order)
+	}
+
+	var results []MatchResult
+	var err error
+	if order.Side == SideBid {
+		results, err = m.executeLimitBid(mkt, order)
+	} else {
+		results, err = m.executeLimitAsk(mkt, order)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range results {
+		if err := settleMatchResult(&results[i], mkt, m.bm); err != nil {
+			return nil, err
+		}
+	}
+	cleanupFilledOrders(mkt, results, order)
+	return results, nil
+}
+
+// CancelOrder 在撮合锁内完成撤单：校验 → 移除 → 解冻
+func (m *Matcher) CancelOrder(mkt *Market, orderID uint64, userID uint32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	order := mkt.Asks.Get(orderID)
+	if order == nil {
+		order = mkt.Bids.Get(orderID)
+	}
+	if order == nil {
+		return fmt.Errorf("order not found")
+	}
+	if order.UserID != userID {
+		return fmt.Errorf("unauthorized")
+	}
+	if order.Side == SideAsk {
+		mkt.Asks.Remove(order)
+	} else {
+		mkt.Bids.Remove(order)
+	}
+	if order.Side == SideBid {
+		return m.bm.Unfreeze(userID, mkt.Money, order.Freeze)
+	}
+	return m.bm.Unfreeze(userID, mkt.Stock, order.Freeze)
+}
+
+// settleMatchResult 成交结算 + 费用扣收
+func settleMatchResult(r *MatchResult, mkt *Market, bm *BalanceManager) error {
+	if r.TakerOrder.Side == SideAsk {
+		// 卖单吃单：释出 base（Stock），收入 quote（Money）扣手续费
+		if err := bm.SettleTrade(r.TakerOrder.UserID, mkt.Stock, decimal.Zero, r.DealAmount.Neg()); err != nil {
+			return err
+		}
+		if err := bm.SettleTrade(r.TakerOrder.UserID, mkt.Money, r.DealMoney.Sub(r.TakerFee), decimal.Zero); err != nil {
+			return err
+		}
+	} else {
+		// 买单吃单：释出 quote（Money）扣手续费，收入 base（Stock）
+		if err := bm.SettleTrade(r.TakerOrder.UserID, mkt.Money, r.TakerFee.Neg(), r.DealMoney.Neg()); err != nil {
+			return err
+		}
+		if err := bm.SettleTrade(r.TakerOrder.UserID, mkt.Stock, r.DealAmount, decimal.Zero); err != nil {
+			return err
+		}
+	}
+	if r.MakerOrder.Side == SideAsk {
+		if err := bm.SettleTrade(r.MakerOrder.UserID, mkt.Stock, decimal.Zero, r.DealAmount.Neg()); err != nil {
+			return err
+		}
+		if err := bm.SettleTrade(r.MakerOrder.UserID, mkt.Money, r.DealMoney.Add(r.MakerRebate), decimal.Zero); err != nil {
+			return err
+		}
+	} else {
+		if err := bm.SettleTrade(r.MakerOrder.UserID, mkt.Money, r.MakerRebate, r.DealMoney.Neg()); err != nil {
+			return err
+		}
+		if err := bm.SettleTrade(r.MakerOrder.UserID, mkt.Stock, r.DealAmount, decimal.Zero); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cleanupFilledOrders 移除已完全成交的订单
+func cleanupFilledOrders(mkt *Market, results []MatchResult, taker *Order) {
+	for _, r := range results {
+		if r.MakerOrder.Left.IsZero() {
+			if r.MakerOrder.Side == SideAsk {
+				mkt.Asks.Remove(r.MakerOrder)
+			} else {
+				mkt.Bids.Remove(r.MakerOrder)
+			}
+		}
+	}
+	if taker.Left.IsZero() {
+		if taker.Side == SideAsk {
+			mkt.Asks.Remove(taker)
+		} else {
+			mkt.Bids.Remove(taker)
+		}
 	}
 }
 
@@ -51,10 +171,8 @@ func (m *Matcher) Match(order *Order) ([]MatchResult, error) {
 	var results []MatchResult
 
 	if order.Side == SideBid {
-		// 买单：从卖一价开始逐级向上吃
 		results, err = m.executeLimitBid(marketData, order)
 	} else {
-		// 卖单：从买一价开始逐级向下吃
 		results, err = m.executeLimitAsk(marketData, order)
 	}
 
